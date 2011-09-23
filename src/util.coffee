@@ -81,33 +81,58 @@ exports.chown = (path, owner, callback) ->
 # that, when invoked, replays the captured events on the stream in
 # order.
 exports.pause = (stream) ->
-  queue = []
-  dataListeners = []
+  queue          = []
+  mutedListeners = {}
+  eventsToMute   = ['data', 'newListener']
 
-  # Ensure we're the only one listening for the 'data' event
-  for listener in stream.listeners 'data'
-    dataListeners.push listener
-  stream.removeAllListeners 'data'
+  # Ensure we're the only one listening for certain events
+  for event in eventsToMute
+    mutedListeners[event] = (l for l in stream.listeners event)
+    stream.removeAllListeners event
 
   onData  = (args...) -> queue.push ['data', args...]
   onEnd   = (args...) -> queue.push ['end', args...]
   onClose = -> removeListeners()
 
+  removeListenerOf = (emitter, event, listener) ->
+    listeners = emitter.listeners event
+    index     = listeners.indexOf listener
+    listeners[index..index] = [] if index > -1
+
+  # Patch stream.removeListener to avoid restoring a removed listener
+  originalRemoveListener = stream.removeListener
+  stream.removeListener = (event, listener) ->
+    if event in eventsToMute
+      # Remove this listener from the list of muted ones
+      mutedListeners[event] = (l for l in mutedListeners[event] when l != listener)
+    else
+      removeListenerOf stream, event, listener
+
+  # Don't allow any new listeners to hook to the muted events
+  onNewListener = (event, listener) ->
+    if event in eventsToMute
+      mutedListeners[event].push listener
+      removeListenerOf stream, event, listener
+
   removeListeners = ->
+    stream.removeListener = originalRemoveListener
     stream.removeListener 'data', onData
     stream.removeListener 'end', onEnd
     stream.removeListener 'close', onClose
+    stream.removeListener 'newListener', onNewListener
 
   stream.on 'data', onData
   stream.on 'end', onEnd
   stream.on 'close', onClose
+  stream.on 'newListener', onNewListener
 
   ->
     removeListeners()
 
-    # Restore the 'data' event listeners
-    for listener in dataListeners
-      stream.on 'data', listener
+    # Restore the muted event listeners
+    for event in eventsToMute
+      for listener in mutedListeners[event]
+        stream.on event, listener if listener
 
     for args in queue
       stream.emit args...
