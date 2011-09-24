@@ -81,61 +81,42 @@ exports.chown = (path, owner, callback) ->
 # that, when invoked, replays the captured events on the stream in
 # order.
 exports.pause = (stream) ->
-  queue          = []
-  mutedListeners = {}
-  eventsToMute   = ['data', 'newListener']
+  unless stream._pausable
+    # Patch this stream object to make it nicely pausable
+    stream._pausable =
+      pauses: 0
+      events: ['data', 'end']
+      queue:  []
+      emit:   stream.emit
+      pause:  -> stream._pausable.pauses++
+      resume: ->
+        if stream._pausable.pauses > 0
+          stream._pausable.pauses--
 
-  # Ensure we're the only one listening for certain events
-  for event in eventsToMute
-    mutedListeners[event] = (l for l in stream.listeners event)
-    stream.removeAllListeners event
+          # No more pauses: empty the queue
+          if stream._pausable.pauses == 0
+            stream.emit args... for args in stream._pausable.queue
+            stream._pausable.queue = []
 
-  onData  = (args...) -> queue.push ['data', args...]
-  onEnd   = (args...) -> queue.push ['end', args...]
+    # Override stream.emit to emulate pausing
+    stream.emit = (event, args...) ->
+      if stream._pausable.pauses > 0 and event in stream._pausable.events
+        stream._pausable.queue.push [event, args...]
+      else
+        args.unshift event
+        stream._pausable.emit.apply stream, args
+
+  stream._pausable.pause()
+
   onClose = -> removeListeners()
-
-  removeListenerOf = (emitter, event, listener) ->
-    listeners = emitter.listeners event
-    index     = listeners.indexOf listener
-    listeners[index..index] = [] if index > -1
-
-  # Patch stream.removeListener to avoid restoring a removed listener
-  originalRemoveListener = stream.removeListener
-  stream.removeListener = (event, listener) ->
-    if event in eventsToMute
-      # Remove this listener from the list of muted ones
-      mutedListeners[event] = (l for l in mutedListeners[event] when l != listener)
-    else
-      removeListenerOf stream, event, listener
-
-  # Don't allow any new listeners to hook to the muted events
-  onNewListener = (event, listener) ->
-    if event in eventsToMute
-      mutedListeners[event].push listener
-      removeListenerOf stream, event, listener
+  stream.on 'close', onClose
 
   removeListeners = ->
-    stream.removeListener = originalRemoveListener
-    stream.removeListener 'data', onData
-    stream.removeListener 'end', onEnd
     stream.removeListener 'close', onClose
-    stream.removeListener 'newListener', onNewListener
-
-  stream.on 'data', onData
-  stream.on 'end', onEnd
-  stream.on 'close', onClose
-  stream.on 'newListener', onNewListener
 
   ->
     removeListeners()
-
-    # Restore the muted event listeners
-    for event in eventsToMute
-      for listener in mutedListeners[event]
-        stream.on event, listener if listener
-
-    for args in queue
-      stream.emit args...
+    stream._pausable.resume()
 
 # Spawn a shell with the given `env` and source the named
 # `script`. Then collect its resulting environment variables and pass
